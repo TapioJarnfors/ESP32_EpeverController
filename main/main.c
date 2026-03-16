@@ -1,73 +1,33 @@
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_timer.h"
+
 #include "driver/uart.h"
 #include "esp_log.h"
-#include "esp_log_level.h"
+#include "esp_err.h"
 
-static const char *TAG = "rtu_sniffer";
+static const char *TAG = "epever_modbus_master";
 
-#define DEBUG              true // true for debug logging, false for production 
+// UART2 to Epever RS-485 adapter
+#define MB_UART           UART_NUM_2
+#define MB_RX_GPIO        16
+#define MB_TX_GPIO        17
 
-// RS-485 sniff input UART (UART2)
-#define SNIFF_UART         UART_NUM_2
-#define SNIFF_RX_GPIO      16
-#define SNIFF_TX_GPIO      17   // unused
+#define MB_BAUDRATE       115200
+#define MB_BUF_SIZE       1024
 
-// Output to PC over USB serial (UART0)
-#define OUT_UART           UART_NUM_0
+// Modbus RTU limits
+#define MB_MAX_FRAME      256
 
-// Rates
-#define SNIFF_BAUDRATE     115200
-#define OUT_BAUDRATE       460800
+// Timeouts (tune if needed)
+#define MB_RESP_TIMEOUT_MS  250   // wait for full response
+#define MB_INTERCHAR_MS      20   // stop when no new bytes arrive
 
-// Buffering
-#define SNIFF_BUF_SIZE     4096
-#define UART_EVENT_QUEUE_SIZE 20
-
-// Modbus RTU framing
-// 115200 8N1 => 1 char ~ 86.8 us; 3.5 chars ~ 304 us.
-// UART RX timeout: configured in symbol times (characters)
-#define RTU_IDLE_THRESH_SYMBOLS  4  // ~4 character times for frame boundary
-
-// Frame buffer limits
-#define RTU_FRAME_MAX      512
-
-// Frame tracking
-static uint32_t frame_count = 0;
-static uint32_t frame_start_ts_us = 0;
-static uint32_t frame_end_ts_us = 0;
-
-// UART event queue
-static QueueHandle_t uart_queue;
-
-static void write_record_to_pc(uint32_t ts_us, uint8_t flags, const uint8_t *data, uint16_t len)
-{
-    // Header: sync(2) + ts(4) + flags(1) + len(2) = 9 bytes
-    uint8_t hdr[8];
-    hdr[0] = 0xA5;
-    hdr[1] = 0x5A;
-
-    hdr[2] = (uint8_t)(ts_us & 0xFF);
-    hdr[3] = (uint8_t)((ts_us >> 8) & 0xFF);
-    hdr[4] = (uint8_t)((ts_us >> 16) & 0xFF);
-    hdr[5] = (uint8_t)((ts_us >> 24) & 0xFF);
-
-//*    hdr[6] = flags; // flags reserved for future use
-
-    hdr[7] = (uint8_t)(len & 0xFF);
-    hdr[8] = (uint8_t)((len >> 8) & 0xFF);
-
-//* write to file    uart_write_bytes(OUT_UART, (const char *)hdr, sizeof(hdr));
-//* write to file    uart_write_bytes(OUT_UART, (const char *)data, len);
-    
-    if (DEBUG) {
-        ESP_LOGI(TAG, "Frame %u: ts=%u us, data_len=%u, flags=0x%02X", ++frame_count, ts_us, len, flags);
-        ESP_LOG_BUFFER_HEX(TAG, data, len);
-    }
-}
+// Slave
+#define MB_SLAVE_ID       1
 
 // Standard Modbus CRC16 (poly 0xA001, init 0xFFFF)
 static uint16_t modbus_crc16(const uint8_t *data, uint16_t len)
@@ -83,111 +43,168 @@ static uint16_t modbus_crc16(const uint8_t *data, uint16_t len)
     return crc;
 }
 
-static void handle_frame(const uint8_t *frame, uint16_t len, uint32_t frame_start_us, uint32_t frame_end_us)
+static void crc_append(uint8_t *frame, uint16_t len_without_crc)
 {
-    (void)frame_start_us;
-
-    if (len < 4) return;
-
-    uint16_t rx_crc = (uint16_t)frame[len - 2] | ((uint16_t)frame[len - 1] << 8);
-    uint16_t calc_crc = modbus_crc16(frame, (uint16_t)(len - 2));
-    bool crc_ok = (rx_crc == calc_crc);
-
-    uint8_t flags = 0;
-    if (crc_ok) {
-        flags |= 0x01; // bit0 = crc_ok
-    }
-
-    write_record_to_pc(frame_end_us, flags, frame, len);
+    uint16_t crc = modbus_crc16(frame, len_without_crc);
+    frame[len_without_crc + 0] = (uint8_t)(crc & 0xFF);        // CRC Lo
+    frame[len_without_crc + 1] = (uint8_t)((crc >> 8) & 0xFF); // CRC Hi
 }
 
-static void sniff_task(void *arg)
+// Build: [id][fc][addr_hi][addr_lo][count_hi][count_lo][crc_lo][crc_hi]
+static uint16_t build_read_input_regs(uint8_t slave, uint16_t start_addr, uint16_t count, uint8_t *out)
 {
-    uint8_t frame[RTU_FRAME_MAX];
-    uint16_t frame_len = 0;
-    uart_event_t event;
+    out[0] = slave;
+    out[1] = 0x04; // Read Input Registers
+    out[2] = (uint8_t)((start_addr >> 8) & 0xFF);
+    out[3] = (uint8_t)(start_addr & 0xFF);
+    out[4] = (uint8_t)((count >> 8) & 0xFF);
+    out[5] = (uint8_t)(count & 0xFF);
+    crc_append(out, 6);
+    return 8;
+}
+
+static esp_err_t uart_send_frame(const uint8_t *frame, uint16_t len)
+{
+    // Flush RX before request (avoid mixing old bytes with new response)
+    uart_flush_input(MB_UART);
+
+    int wr = uart_write_bytes(MB_UART, (const char *)frame, len);
+    if (wr != len) {
+        ESP_LOGE(TAG, "uart_write_bytes wrote %d of %u", wr, len);
+        return ESP_FAIL;
+    }
+
+    // Ensure TX is physically complete
+    ESP_ERROR_CHECK(uart_wait_tx_done(MB_UART, pdMS_TO_TICKS(100)));
+    return ESP_OK;
+}
+
+// Read until either:
+// - expected length satisfied (if expected_len > 0), OR
+// - no new bytes arrive for MB_INTERCHAR_MS, OR
+// - total time exceeds MB_RESP_TIMEOUT_MS
+static int uart_read_frame(uint8_t *buf, int buf_max, int expected_len)
+{
+    int total = 0;
+    int elapsed_ms = 0;
+
+    while (elapsed_ms < MB_RESP_TIMEOUT_MS && total < buf_max) {
+        int want = buf_max - total;
+        // read a chunk with short timeout (inter-char)
+        int got = uart_read_bytes(MB_UART, buf + total, want, pdMS_TO_TICKS(MB_INTERCHAR_MS));
+        elapsed_ms += MB_INTERCHAR_MS;
+
+        if (got > 0) {
+            total += got;
+
+            if (expected_len > 0 && total >= expected_len) {
+                break;
+            }
+
+            // reset inter-char timer effect by not breaking; we keep collecting until quiet
+            // (still bounded by MB_RESP_TIMEOUT_MS)
+        } else {
+            // No bytes this window: if we already have something, treat as end-of-frame
+            if (total > 0) break;
+        }
+    }
+
+    return total;
+}
+
+static bool modbus_validate_crc(const uint8_t *frame, int len)
+{
+    if (len < 4) return false;
+    uint16_t rx_crc = (uint16_t)frame[len - 2] | ((uint16_t)frame[len - 1] << 8);
+    uint16_t calc = modbus_crc16(frame, (uint16_t)(len - 2));
+    return rx_crc == calc;
+}
+
+static void poll_task(void *arg)
+{
+    (void)arg;
+
+    uint8_t req[8];
+    uint8_t resp[MB_MAX_FRAME];
+
+    // Your first test: 01 04 31 00 00 01 CRC
+    const uint16_t start = 0x3100;
+    const uint16_t count = 1;
 
     while (1) {
-        // Wait for UART event (blocks, allowing other tasks to run)
-        if (xQueueReceive(uart_queue, &event, portMAX_DELAY)) {
-            switch (event.type) {
-                case UART_DATA:
-                    // Data available - read it
-                    if (frame_len == 0) {
-                        frame_start_ts_us = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFFu);
-                    }
-                    
-                    // Read the data that triggered this event
-                    size_t to_read = (event.size > (RTU_FRAME_MAX - frame_len)) ? 
-                                    (RTU_FRAME_MAX - frame_len) : event.size;
-                    int len = uart_read_bytes(SNIFF_UART, frame + frame_len, to_read, 0);
-                    if (len > 0) {
-                        frame_len += len;
-                        frame_end_ts_us = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFFu);
-                    }
-                    
-                    // Check if there's more data immediately available
-                    size_t available = 0;
-                    uart_get_buffered_data_len(SNIFF_UART, &available);
-                    
-                    // If no more data is available, this is the end of a frame (RX timeout occurred)
-                    if (available == 0 && frame_len > 0) {
-                        handle_frame(frame, frame_len, frame_start_ts_us, frame_end_ts_us);
-                        frame_len = 0;
-                        frame_start_ts_us = 0;
-                        frame_end_ts_us = 0;
-                    }
-                    break;
+        uint16_t req_len = build_read_input_regs(MB_SLAVE_ID, start, count, req);
 
-                case UART_BUFFER_FULL:
-                    ESP_LOGW(TAG, "UART buffer full - flushing");
-                    uart_flush_input(SNIFF_UART);
-                    frame_len = 0;
-                    break;
+        ESP_LOGI(TAG, "TX: %02X %02X %02X %02X %02X %02X %02X %02X",
+                 req[0], req[1], req[2], req[3], req[4], req[5], req[6], req[7]);
 
-                case UART_FIFO_OVF:
-                    ESP_LOGW(TAG, "UART FIFO overflow - flushing");
-                    uart_flush_input(SNIFF_UART);
-                    frame_len = 0;
-                    break;
-                    // test row from github copilot
-
-                default:
-                    break;
-            }
+        if (uart_send_frame(req, req_len) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
         }
+
+        // Expected response length for FC=0x04, count=1:
+        // [id][fc][bytecount=2][data_hi][data_lo][crc_lo][crc_hi] = 7 bytes
+        int got = uart_read_frame(resp, sizeof(resp), 7);
+
+        if (got <= 0) {
+            ESP_LOGW(TAG, "No response");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "RX len=%d", got);
+        ESP_LOG_BUFFER_HEX(TAG, resp, got);
+
+        if (!modbus_validate_crc(resp, got)) {
+            ESP_LOGW(TAG, "Bad CRC");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Basic Modbus checks
+        if (got >= 5 && resp[0] == MB_SLAVE_ID && resp[1] == 0x04) {
+            uint8_t bytecount = resp[2];
+
+            // Exception response: fc | 0x80
+            if (resp[1] & 0x80) {
+                ESP_LOGE(TAG, "Modbus exception code=0x%02X", resp[2]);
+            } else if (bytecount == 2 && got >= 7) {
+                uint16_t reg = ((uint16_t)resp[3] << 8) | (uint16_t)resp[4];
+
+                // 0x3100 PV array voltage: ÷100 V
+                float pv_v = ((float)reg) / 100.0f;
+                ESP_LOGI(TAG, "0x3100 PV voltage raw=0x%04X => %.2f V", reg, pv_v);
+            } else {
+                ESP_LOGW(TAG, "Unexpected bytecount=%u (got len=%d)", bytecount, got);
+            }
+        } else {
+            ESP_LOGW(TAG, "Unexpected response header");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Booting Modbus RTU sniffer (UART HW idle detection)");
-    ESP_LOGI(TAG, "Sniff UART2: %d 8N1 (RX GPIO%d). Output UART0: %d baud.",
-             SNIFF_BAUDRATE, SNIFF_RX_GPIO, OUT_BAUDRATE);
-    ESP_LOGI(TAG, "UART RX idle threshold: %u symbol times", RTU_IDLE_THRESH_SYMBOLS);
+    ESP_LOGI(TAG, "Booting Epever Modbus RTU master (UART2 TX=%d RX=%d, %d 8N1)",
+             MB_TX_GPIO, MB_RX_GPIO, MB_BAUDRATE);
 
-    uart_config_t sniff_cfg = {
-        .baud_rate = SNIFF_BAUDRATE,
+    uart_config_t cfg = {
+        .baud_rate = MB_BAUDRATE,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
-        .rx_flow_ctrl_thresh = 122,
     };
 
-    // Install UART driver with event queue
-    ESP_ERROR_CHECK(uart_driver_install(SNIFF_UART, SNIFF_BUF_SIZE, 0, UART_EVENT_QUEUE_SIZE, &uart_queue, 0));
-    ESP_ERROR_CHECK(uart_param_config(SNIFF_UART, &sniff_cfg));
-    ESP_ERROR_CHECK(uart_set_pin(SNIFF_UART, SNIFF_TX_GPIO, SNIFF_RX_GPIO,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    
-    // Set RX timeout threshold (in symbol times)
-    ESP_ERROR_CHECK(uart_set_rx_timeout(SNIFF_UART, RTU_IDLE_THRESH_SYMBOLS));
+    ESP_ERROR_CHECK(uart_driver_install(MB_UART, MB_BUF_SIZE, MB_BUF_SIZE, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(MB_UART, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(MB_UART, MB_TX_GPIO, MB_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    // Install UART0 driver and set higher baud rate for output
-    ESP_ERROR_CHECK(uart_driver_install(OUT_UART, SNIFF_BUF_SIZE, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_set_baudrate(OUT_UART, OUT_BAUDRATE));
+    // If you later add DE/RE control, we can switch to:
+    // uart_set_mode(MB_UART, UART_MODE_RS485_HALF_DUPLEX) + set RTS pin for DE/RE.
 
-    xTaskCreate(sniff_task, "sniff_task", 4096, NULL, 5, NULL);
+    xTaskCreate(poll_task, "modbus_poll", 4096, NULL, 5, NULL);
 }
