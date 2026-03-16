@@ -1,0 +1,14 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "ESP-IDF: Build",
+			"type": "shell",
+			"command": "${config:idf.pythonBinPath} ${config:idf.espIdfPath}/tools/idf.py build",
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		}
+	]
+}
