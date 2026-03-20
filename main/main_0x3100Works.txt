@@ -120,10 +120,6 @@ static bool modbus_validate_crc(const uint8_t *frame, int len)
     return rx_crc == calc;
 }
 
-// Helpers for decoding
-static int16_t s16(uint16_t v) { return (int16_t)v; }
-static uint32_t u32_from_regs(uint16_t lo, uint16_t hi) { return ((uint32_t)hi << 16) | (uint32_t)lo; }
-
 static void poll_task(void *arg)
 {
     (void)arg;
@@ -131,8 +127,9 @@ static void poll_task(void *arg)
     uint8_t req[8];
     uint8_t resp[MB_MAX_FRAME];
 
+    // Your first test: 01 04 31 00 00 01 CRC
     const uint16_t start = 0x3100;
-    const uint16_t count = 0x10; // 16 registers => 0x3100..0x310F
+    const uint16_t count = 1;
 
     while (1) {
         uint16_t req_len = build_read_input_regs(MB_SLAVE_ID, start, count, req);
@@ -145,9 +142,9 @@ static void poll_task(void *arg)
             continue;
         }
 
-        // Response: [id][fc][bytecount][data...][crc_lo][crc_hi]
-        const int expected = 1 + 1 + 1 + (2 * count) + 2; // = 69 bytes for count=32
-        int got = uart_read_frame(resp, sizeof(resp), expected);
+        // Expected response length for FC=0x04, count=1:
+        // [id][fc][bytecount=2][data_hi][data_lo][crc_lo][crc_hi] = 7 bytes
+        int got = uart_read_frame(resp, sizeof(resp), 7);
 
         if (got <= 0) {
             ESP_LOGW(TAG, "No response");
@@ -164,76 +161,24 @@ static void poll_task(void *arg)
             continue;
         }
 
-        if (resp[0] != MB_SLAVE_ID) {
-            ESP_LOGW(TAG, "Unexpected slave id 0x%02X", resp[0]);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
+        // Basic Modbus checks
+        if (got >= 5 && resp[0] == MB_SLAVE_ID && resp[1] == 0x04) {
+            uint8_t bytecount = resp[2];
 
-        // Exception response: function | 0x80
-        if (resp[1] & 0x80) {
-            ESP_LOGE(TAG, "Modbus exception for fc=0x%02X, code=0x%02X", resp[1], resp[2]);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
+            // Exception response: fc | 0x80
+            if (resp[1] & 0x80) {
+                ESP_LOGE(TAG, "Modbus exception code=0x%02X", resp[2]);
+            } else if (bytecount == 2 && got >= 7) {
+                uint16_t reg = ((uint16_t)resp[3] << 8) | (uint16_t)resp[4];
 
-        if (resp[1] != 0x04) {
-            ESP_LOGW(TAG, "Unexpected function 0x%02X", resp[1]);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
-
-        uint8_t bytecount = resp[2];
-        if (bytecount != (uint8_t)(2 * count)) {
-            ESP_LOGW(TAG, "Unexpected bytecount=%u expected=%u", bytecount, (unsigned)(2 * count));
-            // continue anyway; we'll parse what we got safely
-        }
-
-        // Parse registers (big-endian per register)
-        uint16_t regs[0x20] = {0};
-        int data_bytes = got - 5; // subtract [id][fc][bc] + [crc_lo][crc_hi] => 3+2 = 5
-        int regs_available = data_bytes / 2;
-        if (regs_available > (int)count) regs_available = (int)count;
-        if (regs_available < 0) regs_available = 0;
-
-        for (int i = 0; i < regs_available; i++) {
-            regs[i] = ((uint16_t)resp[3 + 2*i] << 8) | (uint16_t)resp[3 + 2*i + 1];
-        }
-
-        // 1) Raw dump in register form for validation
-        // (each line: address: value)
-        for (int i = 0; i < regs_available; i++) {
-            ESP_LOGI(TAG, "REG 0x%04X = 0x%04X (%u)", (unsigned)(start + i), regs[i], (unsigned)regs[i]);
-        }
-
-        // 2) Decoded values (per your markdown map)
-        if (regs_available >= 0x10) {
-            float pv_v   = regs[0x00] / 100.0f; // 0x3100
-            float pv_i   = regs[0x01] / 100.0f; // 0x3101
-            float pv_p   = u32_from_regs(regs[0x02], regs[0x03]) / 100.0f; // 0x3102-0x3103
-
-            float batt_p = u32_from_regs(regs[0x06], regs[0x07]) / 100.0f; // 0x3106-0x3107
-
-            float load_v = regs[0x0C] / 100.0f; // 0x310C
-            float load_i = regs[0x0D] / 100.0f; // 0x310D
-            float load_p = u32_from_regs(regs[0x0E], regs[0x0F]) / 100.0f; // 0x310E-0x310F
-
-            /* 
-            float batt_temp = s16(regs[0x10]) / 100.0f; // 0x3110
-            float ctrl_temp = s16(regs[0x11]) / 100.0f; // 0x3111
-            float comp_temp = s16(regs[0x12]) / 100.0f; // 0x3112
-
-            float soc   = regs[0x1A] / 100.0f; // 0x311A
-            float sys_v = regs[0x1D] / 100.0f; // 0x311D
-            */
-            ESP_LOGI(TAG, "PV:   %.2f V, %.2f A, %.2f W", pv_v, pv_i, pv_p);
-            ESP_LOGI(TAG, "LOAD: %.2f V, %.2f A, %.2f W", load_v, load_i, load_p);
-//*            ESP_LOGI(TAG, "BATT: power=%.2f W, SOC=%.2f%%, sys_rated=%.2f V", batt_p, soc, sys_v);
-//*            ESP_LOGI(TAG, "TEMP: batt=%.2f C, ctrl=%.2f C, comp=%.2f C", batt_temp, ctrl_temp, comp_temp);
-            ESP_LOGI(TAG, "BATT: power=%.2f W", batt_p);
-
+                // 0x3100 PV array voltage: ÷100 V
+                float pv_v = ((float)reg) / 100.0f;
+                ESP_LOGI(TAG, "0x3100 PV voltage raw=0x%04X => %.2f V", reg, pv_v);
+            } else {
+                ESP_LOGW(TAG, "Unexpected bytecount=%u (got len=%d)", bytecount, got);
+            }
         } else {
-            ESP_LOGW(TAG, "Not enough registers received to decode block (regs_available=%d)", regs_available);
+            ESP_LOGW(TAG, "Unexpected response header");
         }
 
         vTaskDelay(pdMS_TO_TICKS(1000));
