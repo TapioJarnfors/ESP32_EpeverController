@@ -12,6 +12,7 @@
 *.swo
 *.bak
 *.tmp
+*.b64
 
 # Log files
 *.log
@@ -31,6 +32,9 @@ build/
 flasher_args.json # Generated in build directory
 sdkconfig.old
 sdkconfig
+
+# Certificate files (embedded in code, not needed separately)
+main/certs/
 
 # ESP-IDF dependencies
 # For older versions or manual component management
