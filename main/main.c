@@ -9,6 +9,11 @@
 #include "esp_log.h"
 #include "esp_err.h"
 
+// WiFi and MQTT integration
+#include "epever_data.h"
+#include "wifi_manager.h"
+#include "mqtt_manager.h"
+
 static const char *TAG = "epever_modbus_master";
 
 // UART2 to Epever RS-485 adapter
@@ -124,6 +129,10 @@ static bool modbus_validate_crc(const uint8_t *frame, int len)
 static int16_t s16(uint16_t v) { return (int16_t)v; }
 static uint32_t u32_from_regs(uint16_t lo, uint16_t hi) { return ((uint32_t)hi << 16) | (uint32_t)lo; }
 
+// Forward declarations
+static void poll_task(void *arg);
+static void mqtt_publish_task(void *arg);
+
 static void poll_task(void *arg)
 {
     (void)arg;
@@ -132,7 +141,8 @@ static void poll_task(void *arg)
     uint8_t resp[MB_MAX_FRAME];
 
     const uint16_t start = 0x3100;
-    const uint16_t count = 0x10; // 16 registers => 0x3100..0x310F
+//*    const uint16_t count = 0x20; // 32 registers => 0x3100..0x311F (includes temps, SOC, sys_v)
+    const uint16_t count = 0x05; // 32 registers => 0x3100..0x311F (includes temps, SOC, sys_v)
 
     while (1) {
         uint16_t req_len = build_read_input_regs(MB_SLAVE_ID, start, count, req);
@@ -207,30 +217,56 @@ static void poll_task(void *arg)
         }
 
         // 2) Decoded values (per your markdown map)
-        if (regs_available >= 0x10) {
+//*        if (regs_available >= 0x10) {
+        if (regs_available >= 0x05) {
+            // Decode sensor values
             float pv_v   = regs[0x00] / 100.0f; // 0x3100
             float pv_i   = regs[0x01] / 100.0f; // 0x3101
             float pv_p   = u32_from_regs(regs[0x02], regs[0x03]) / 100.0f; // 0x3102-0x3103
 
+            float batt_v = regs[0x04] / 100.0f; // 0x3104
+            float batt_i = regs[0x05] / 100.0f; // 0x3105
             float batt_p = u32_from_regs(regs[0x06], regs[0x07]) / 100.0f; // 0x3106-0x3107
 
             float load_v = regs[0x0C] / 100.0f; // 0x310C
             float load_i = regs[0x0D] / 100.0f; // 0x310D
             float load_p = u32_from_regs(regs[0x0E], regs[0x0F]) / 100.0f; // 0x310E-0x310F
 
-            /* 
-            float batt_temp = s16(regs[0x10]) / 100.0f; // 0x3110
-            float ctrl_temp = s16(regs[0x11]) / 100.0f; // 0x3111
-            float comp_temp = s16(regs[0x12]) / 100.0f; // 0x3112
+            // Extended values (if available)
+            float batt_temp = (regs_available > 0x10) ? s16(regs[0x10]) / 100.0f : 0.0f; // 0x3110
+            float ctrl_temp = (regs_available > 0x11) ? s16(regs[0x11]) / 100.0f : 0.0f; // 0x3111
+            float comp_temp = (regs_available > 0x12) ? s16(regs[0x12]) / 100.0f : 0.0f; // 0x3112
+            float soc       = (regs_available > 0x1A) ? regs[0x1A] / 100.0f : 0.0f;      // 0x311A
+            float sys_v     = (regs_available > 0x1D) ? regs[0x1D] / 100.0f : 0.0f;      // 0x311D
 
-            float soc   = regs[0x1A] / 100.0f; // 0x311A
-            float sys_v = regs[0x1D] / 100.0f; // 0x311D
-            */
-            ESP_LOGI(TAG, "PV:   %.2f V, %.2f A, %.2f W", pv_v, pv_i, pv_p);
-            ESP_LOGI(TAG, "LOAD: %.2f V, %.2f A, %.2f W", load_v, load_i, load_p);
-//*            ESP_LOGI(TAG, "BATT: power=%.2f W, SOC=%.2f%%, sys_rated=%.2f V", batt_p, soc, sys_v);
-//*            ESP_LOGI(TAG, "TEMP: batt=%.2f C, ctrl=%.2f C, comp=%.2f C", batt_temp, ctrl_temp, comp_temp);
-            ESP_LOGI(TAG, "BATT: power=%.2f W", batt_p);
+            // Log key values (reduced verbosity)
+            ESP_LOGI(TAG, "PV: %.2fV %.2fA %.2fW | BATT: %.2fV %.2fA %.2fW %.1f%% | LOAD: %.2fV %.2fA %.2fW",
+                     pv_v, pv_i, pv_p, batt_v, batt_i, batt_p, soc, load_v, load_i, load_p);
+            if (regs_available > 0x12) {
+                ESP_LOGI(TAG, "TEMP: Batt=%.1fC Ctrl=%.1fC Comp=%.1fC | Sys=%.1fV",
+                         batt_temp, ctrl_temp, comp_temp, sys_v);
+            }
+
+            // Write to shared data structure for MQTT publishing
+            epever_data_t data = {
+                .pv_voltage = pv_v,
+                .pv_current = pv_i,
+                .pv_power = pv_p,
+                .battery_voltage = batt_v,
+                .battery_current = batt_i,
+                .battery_power = batt_p,
+                .battery_soc = soc,
+                .load_voltage = load_v,
+                .load_current = load_i,
+                .load_power = load_p,
+                .battery_temp = batt_temp,
+                .controller_temp = ctrl_temp,
+                .component_temp = comp_temp,
+                .system_voltage = sys_v,
+                .timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS,
+                .valid = true
+            };
+            epever_data_write(&data);
 
         } else {
             ESP_LOGW(TAG, "Not enough registers received to decode block (regs_available=%d)", regs_available);
@@ -261,5 +297,62 @@ void app_main(void)
     // If you later add DE/RE control, we can switch to:
     // uart_set_mode(MB_UART, UART_MODE_RS485_HALF_DUPLEX) + set RTS pin for DE/RE.
 
+    // Initialize shared data structure
+    epever_data_init();
+    
+    // Initialize WiFi
+    ESP_LOGI(TAG, "Initializing WiFi...");
+    wifi_init();
+    
+    // Initialize MQTT
+    ESP_LOGI(TAG, "Initializing MQTT...");
+    mqtt_init();
+    mqtt_start();
+    
+    // Create Modbus polling task
     xTaskCreate(poll_task, "modbus_poll", 4096, NULL, 5, NULL);
+    
+    // Create MQTT publishing task
+    xTaskCreate(mqtt_publish_task, "mqtt_publish", 4096, NULL, 4, NULL);
+}
+
+// MQTT publishing task - publishes sensor data every 30 seconds
+static void mqtt_publish_task(void *arg)
+{
+    (void)arg;
+    
+    ESP_LOGI(TAG, "MQTT publish task started");
+    
+    // Wait for WiFi connection
+    ESP_LOGI(TAG, "Waiting for WiFi connection...");
+    wifi_wait_connected(0); // Wait indefinitely
+    ESP_LOGI(TAG, "WiFi connected!");
+    
+    // Give MQTT some time to connect after WiFi is up
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    while (1) {
+        // Check if both WiFi and MQTT are connected
+        if (wifi_is_connected() && mqtt_is_connected()) {
+            // Read sensor data and publish
+            epever_data_t data;
+            epever_data_read(&data);
+            
+            if (data.valid) {
+                mqtt_publish_sensors(&data);
+            } else {
+                ESP_LOGW(TAG, "Sensor data not valid yet, skipping publish");
+            }
+        } else {
+            if (!wifi_is_connected()) {
+                ESP_LOGW(TAG, "WiFi not connected, waiting...");
+            }
+            if (!mqtt_is_connected()) {
+                ESP_LOGW(TAG, "MQTT not connected, waiting...");
+            }
+        }
+        
+        // Publish every 30 seconds
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
 }
