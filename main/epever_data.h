@@ -5,6 +5,10 @@
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "esp_err.h"
 
 /**
  * @brief Structure to hold all Epever solar charge controller sensor data
@@ -63,5 +67,18 @@ void epever_data_write(const epever_data_t *data);
  * @param data Pointer to the data structure to populate
  */
 void epever_data_read(epever_data_t *data);
+
+/**
+ * @brief Initialize Epever controller communication and start polling task
+ * 
+ * This function initializes the UART interface for Modbus RTU communication,
+ * initializes the shared data structure, and spawns the polling task that
+ * continuously reads sensor data from the Epever charge controller.
+ * 
+ * Must be called once during system initialization.
+ * 
+ * @return ESP_OK on success, ESP_FAIL on error
+ */
+esp_err_t epever_init(void);
 
 #endif // EPEVER_DATA_H
