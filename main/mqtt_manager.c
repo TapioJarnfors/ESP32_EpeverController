@@ -16,6 +16,7 @@ static bool s_mqtt_connected = false;
 #define HA_AVAILABILITY_TOPIC "jussila/sensor/epever/availability"
 
 // HiveMQ Cloud CA Certificate (ISRG Root X1 - Let's Encrypt)
+/*
 static const char hivemq_ca_cert[] = 
 "-----BEGIN CERTIFICATE-----\n"
 "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n"
@@ -48,6 +49,7 @@ static const char hivemq_ca_cert[] =
 "mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d\n"
 "emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=\n"
 "-----END CERTIFICATE-----";
+*/
 
 // Forward declarations
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
